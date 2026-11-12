@@ -2,7 +2,7 @@ name: Program dates check
 on:
   schedule:
     - cron: "0 13 * * *"   # daily, 13:00 UTC
-  workflow_dispatch: {}     # manual test run
+  workflow_dispatch: {}     # manual test run (always sends a test email)
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -11,12 +11,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install anthropic gspread
+      - run: pip install gspread requests
       - run: python program-check.py
         env:
           TARGET_YEAR: "2027"
           FORCE_EMAIL: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
