@@ -12,7 +12,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install anthropic gspread
-      - run: python check_screp.py
+      - run: python program-check.py
         env:
           TARGET_YEAR: "2027"
           FORCE_EMAIL: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
