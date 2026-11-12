@@ -9,6 +9,7 @@
 Env: ANTHROPIC_API_KEY, GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID,
      GMAIL_USER, GMAIL_APP_PASSWORD, NOTIFY_TO, TARGET_YEAR (default 2027)
 """
+import base64
 import datetime
 import json
 import os
@@ -123,10 +124,27 @@ def send_email(subject: str, body: str) -> None:
         s.send_message(msg)
 
 
-def main() -> None:
-    gc = gspread.service_account_from_dict(
-        json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+def load_service_account() -> dict:
+    """Read the key from the secret; tolerate paste problems and base64."""
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    cleaned = raw.replace("\ufeff", "").strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(base64.b64decode(cleaned).decode("utf-8"))
+    except Exception:
+        pass
+    codes = [ord(c) for c in raw[:3]]
+    raise SystemExit(
+        "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON or base64. "
+        f"length={len(raw)}, first 3 char codes={codes}"
     )
+
+
+def main() -> None:
+    gc = gspread.service_account_from_dict(load_service_account())
     ws = gc.open_by_key(os.environ["SHEET_ID"]).sheet1
     data = ws.get_all_values()
     headers = [norm(h) for h in data[0]]
@@ -175,17 +193,21 @@ def main() -> None:
             f"{name}\n" + "\n".join(lines) + f"\n  source: {result.get('source_url', '')}"
         )
 
+    force = os.environ.get("FORCE_EMAIL") == "1"  # manual test runs
+    monday = today.weekday() == 0
     parts = []
     if found:
         parts.append(f"{TARGET_YEAR} info is now posted (sheet updated):\n\n" + "\n\n".join(found))
-    if today.weekday() == 0 and pending:
+    if (monday or force) and pending:
         parts.append("Still waiting on:\n" + "\n".join(pending))
-    if errors and (found or today.weekday() == 0):
+    if errors and (found or monday or force):
         parts.append("Errors:\n" + "\n".join(errors))
     if found:
         send_email(f"{len(found)} program(s) posted {TARGET_YEAR} dates", "\n\n".join(parts))
-    elif today.weekday() == 0 and (pending or errors):
-        send_email("Weekly update: nothing new yet", "\n\n".join(parts))
+    elif force or (monday and (pending or errors)):
+        subject = "Test run: email is working" if force else "Weekly update: nothing new yet"
+        body = "\n\n".join(parts) or f"No program has posted {TARGET_YEAR} info yet."
+        send_email(subject, body)
     print("\n\n".join(parts) or "Nothing to report.")
 
 
