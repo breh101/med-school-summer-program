@@ -12,7 +12,7 @@ How it works:
 
 Env: GEMINI_API_KEY, GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID, GMAIL_USER,
      GMAIL_APP_PASSWORD, NOTIFY_TO, TARGET_YEAR (default 2027),
-     GEMINI_MODEL (default gemini-2.5-flash)
+     GEMINI_MODEL (optional; otherwise auto-picks a stable Flash Lite model)
 """
 import base64
 import datetime
@@ -159,13 +159,29 @@ def pick_model() -> str:
             continue
         ver = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
         stable = not any(t in name for t in ("preview", "exp"))
-        cands.append(((stable, float(ver.group(1)) if ver else 0.0, "lite" not in name), name))
+        cands.append(((stable, "lite" in name, float(ver.group(1)) if ver else 0.0), name))
     if not cands:
         raise RuntimeError("No Gemini Flash model is available to this API key.")
     best = max(cands)[1]
     _MODEL_CACHE.append(best)
     print(f"Using Gemini model: {best}")
     return best
+
+
+def _retry_delay(response, attempt: int) -> float:
+    retry_after = response.headers.get("Retry-After", "")
+    try:
+        return min(max(float(retry_after), 1), 120)
+    except ValueError:
+        pass
+    try:
+        for detail in response.json().get("error", {}).get("details", []):
+            retry_delay = re.fullmatch(r"(\d+(?:\.\d+)?)s", detail.get("retryDelay", ""))
+            if retry_delay:
+                return min(max(float(retry_delay.group(1)), 1), 120)
+    except (ValueError, AttributeError):
+        pass
+    return 15 * (2 ** attempt)
 
 
 def gemini_extract(prompt: str) -> dict:
@@ -176,18 +192,33 @@ def gemini_extract(prompt: str) -> dict:
         "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
     }
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"], "Content-Type": "application/json"}
+    retryable_statuses = (408, 429, 500, 502, 503, 504)
+    last_error = None
+    last_response = None
     for attempt in range(4):
-        r = requests.post(url, headers=headers, json=body, timeout=90)
-        if r.status_code in (429, 500, 503):
-            time.sleep(15 * (attempt + 1))
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=180)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_error = e
+            if attempt < 3:
+                time.sleep(15 * (2 ** attempt))
+                continue
+            break
+        if r.status_code in retryable_statuses:
+            last_response = r
+            if attempt < 3:
+                time.sleep(_retry_delay(r, attempt))
             continue
         if not r.ok:
             raise RuntimeError(f"Gemini {r.status_code} using model {model}: {r.text[:200]}")
         data = r.json()
         return parse_model_json(data["candidates"][0]["content"]["parts"][0]["text"])
-    raise RuntimeError(
-        "Gemini rate-limited or unavailable. Check your free-tier limits in Google AI Studio."
-    )
+    if last_response is not None:
+        raise RuntimeError(
+            f"Gemini {last_response.status_code} using model {model} after retries: "
+            f"{last_response.text[:200]}"
+        )
+    raise RuntimeError(f"Gemini request using model {model} failed after retries: {last_error}")
 
 
 def build_prompt(name, university, current, url, page_text):
@@ -223,7 +254,7 @@ def check_program(name, university, current, sources) -> dict:
             continue
         if TARGET_YEAR not in text:
             continue
-        time.sleep(5)  # stay under free-tier requests-per-minute
+        time.sleep(15)  # leave headroom for free-tier requests-per-minute limits
         result = gemini_extract(
             build_prompt(name, university, current, url, focus(text))
         )
