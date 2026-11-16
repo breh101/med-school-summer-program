@@ -1,12 +1,16 @@
-"""Daily check of every program in the Google Sheet for next-cycle dates (free version).
+"""Scheduled check of every program in the Google Sheet for next-cycle dates (free version).
 
 How it works:
+- Runs four times daily, about six hours apart.
 - Skips rows whose "Expected Release" is "Out Now".
 - Fetches each program's Source URL page(s) directly (free).
 - Only if the page text mentions the target year does it ask Gemini (free tier)
   to read the page and pull out dates.
-- When dates are found: fills the sheet, sets Expected Release to "Out Now",
-  stamps Last Updated, and emails you right away.
+- Marks missing 2027 stipend, dates, and deadlines as "N/A" after all source pages
+  are readable, then replaces those placeholders when values are announced.
+- When 2027 info is found: fills the sheet, records the application opening date
+  or marks Expected Release "Out Now" only when applications are open, stamps Last
+  Updated, and emails you right away.
 - Mondays (UTC): emails a status digest of programs still pending.
 - Manual workflow runs (FORCE_EMAIL=1) always send an email, as a test.
 
@@ -38,6 +42,8 @@ FILL_COLUMNS = {  # Gemini JSON key -> sheet header (normalized)
     "deadline": "deadline",
     "decision_date": "decision date",
 }
+NA_VALUE = "N/A"
+REQUIRED_2027_FIELDS = ("stipend", "dates", "deadline")
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -252,18 +258,22 @@ def build_prompt(name, university, current, url, page_text):
 def check_program(name, university, current, sources) -> dict:
     notes = []
     if not sources:
-        return {"found": False, "notes": "No Source URL in the sheet."}
+        return {"found": False, "checked": False, "notes": "No Source URL in the sheet."}
     if all(generic for _, generic in sources):
         notes.append("only a homepage is listed; add the program's own page")
+    read_count = 0
+    failed_count = 0
     for url, _ in sources:
         try:
             text = fetch_text(url)
         except Exception as e:
+            failed_count += 1
             source = urlparse(url)
             notes.append(
                 f"couldn't read {source.netloc}{source.path} ({str(e)[:200]})"
             )
             continue
+        read_count += 1
         if TARGET_YEAR not in text:
             continue
         time.sleep(15)  # leave headroom for free-tier requests-per-minute limits
@@ -272,9 +282,14 @@ def check_program(name, university, current, sources) -> dict:
         )
         if result.get("found"):
             result["source_url"] = url
+            result["checked"] = True
             return result
         notes.append(f"{urlparse(url).netloc} mentions {TARGET_YEAR} but no dates yet")
-    return {"found": False, "notes": "; ".join(notes) or f"no {TARGET_YEAR} on the page(s) yet"}
+    return {
+        "found": False,
+        "checked": read_count > 0 and failed_count == 0,
+        "notes": "; ".join(notes) or f"no {TARGET_YEAR} on the page(s) yet",
+    }
 
 
 # ---------- Google Sheet + email ----------
@@ -343,31 +358,43 @@ def main() -> None:
 
         if not result.get("found"):
             pending.append(f"- {name}: {result.get('notes', 'nothing new')}")
+            if result.get("checked"):
+                updates = []
+                for header in REQUIRED_2027_FIELDS:
+                    if header in col and norm(row[col[header]]) != norm(NA_VALUE):
+                        updates.append({
+                            "range": rowcol_to_a1(row_num, col[header] + 1),
+                            "values": [[NA_VALUE]],
+                        })
+                if updates:
+                    if "last updated" in col:
+                        updates.append({
+                            "range": rowcol_to_a1(row_num, col["last updated"] + 1),
+                            "values": [[today.isoformat()]],
+                        })
+                    ws.batch_update(updates, value_input_option="RAW")
             continue
 
         updates, lines = [], []
         for key, header in FILL_COLUMNS.items():
             val = (result.get(key) or "").strip()
-            clear_unconfirmed_deadline = (
-                key == "deadline"
-                and result.get("application_open_date")
-                and not val
-            )
-            if header in col and (val or clear_unconfirmed_deadline):
+            if key in REQUIRED_2027_FIELDS and not val:
+                val = NA_VALUE
+            if header in col and val and norm(row[col[header]]) != norm(val):
                 updates.append({"range": rowcol_to_a1(row_num, col[header] + 1), "values": [[val]]})
-                lines.append(f"  {header}: {val or 'not stated for 2027'}")
+            if header in col and (val or key in REQUIRED_2027_FIELDS):
+                lines.append(f"  {header}: {val}")
         if result.get("applications_open"):
             release = "Out Now"
         else:
             release = (result.get("application_open_date") or "").strip()
-        if release:
+        if release and norm(row[col["expected release"]]) != norm(release):
             updates.append({
                 "range": rowcol_to_a1(row_num, col["expected release"] + 1),
                 "values": [[release]],
             })
             lines.append(f"  expected release: {release}")
         if not updates:
-            errors.append(f"{name}: Gemini confirmed {TARGET_YEAR} information but returned no values to update.")
             continue
         if "last updated" in col:
             updates.append({"range": rowcol_to_a1(row_num, col["last updated"] + 1), "values": [[today.isoformat()]]})
@@ -375,17 +402,19 @@ def main() -> None:
         found.append(f"{name}\n" + "\n".join(lines) + f"\n  source: {result.get('source_url', '')}")
 
     force = os.environ.get("FORCE_EMAIL") == "1"  # manual test runs
-    monday = today.weekday() == 0
+    weekly_digest = (
+        today.weekday() == 0 and os.environ.get("WEEKLY_DIGEST") == "1"
+    )
     parts = []
     if found:
         parts.append(f"{TARGET_YEAR} info is now posted (sheet updated):\n\n" + "\n\n".join(found))
-    if (monday or force) and pending:
+    if (weekly_digest or force) and pending:
         parts.append("Still waiting on:\n" + "\n".join(pending))
-    if errors and (found or monday or force):
+    if errors and (found or weekly_digest or force):
         parts.append("Errors:\n" + "\n".join(errors))
     if found:
         send_email(f"{len(found)} program(s) posted {TARGET_YEAR} info", "\n\n".join(parts))
-    elif force or (monday and (pending or errors)):
+    elif force or (weekly_digest and (pending or errors)):
         subject = "Test run: email is working" if force else "Weekly update: nothing new yet"
         body = "\n\n".join(parts) or f"No program has posted {TARGET_YEAR} info yet."
         send_email(subject, body)
