@@ -30,14 +30,20 @@ import requests
 from gspread.utils import rowcol_to_a1
 
 TARGET_YEAR = os.environ.get("TARGET_YEAR", "2027")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip()  # blank = auto-pick a free Flash model
+_MODEL_CACHE = []
 FILL_COLUMNS = {  # Gemini JSON key -> sheet header (normalized)
     "stipend": "stipend",
     "dates": "dates",
     "deadline": "deadline",
     "decision_date": "decision date",
 }
-HEADERS = {"User-Agent": "Mozilla/5.0 (program-date-checker)"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 # ---------- helpers ----------
@@ -65,7 +71,7 @@ class TextExtractor(HTMLParser):
             self.parts.append(data.strip())
 
 
-def fetch_text(url: str) -> str:
+def _direct_text(url: str) -> str:
     r = requests.get(url, headers=HEADERS, timeout=25)
     r.raise_for_status()
     ctype = r.headers.get("content-type", "").lower()
@@ -74,6 +80,26 @@ def fetch_text(url: str) -> str:
     parser = TextExtractor()
     parser.feed(r.text)
     return re.sub(r"\s+", " ", " ".join(parser.parts))
+
+
+def fetch_text(url: str) -> str:
+    """Fetch page text. Many university sites block GitHub's servers (403/404),
+    so fall back to the free r.jina.ai reader, which fetches the public page for us."""
+    try:
+        return _direct_text(url)
+    except Exception as first:
+        if os.environ.get("USE_READER_FALLBACK", "1") != "1":
+            raise
+        try:
+            r = requests.get(
+                "https://r.jina.ai/" + url,
+                headers={"User-Agent": HEADERS["User-Agent"], "Accept": "text/plain"},
+                timeout=60,
+            )
+            r.raise_for_status()
+            return re.sub(r"\s+", " ", r.text)
+        except Exception:
+            raise first
 
 
 def focus(text: str, limit: int = 30000) -> str:
@@ -110,8 +136,41 @@ def parse_model_json(text: str) -> dict:
     return json.loads(text)
 
 
+def pick_model() -> str:
+    """Use GEMINI_MODEL if set; otherwise ask the API which Flash models this key can use."""
+    if GEMINI_MODEL:
+        return GEMINI_MODEL
+    if _MODEL_CACHE:
+        return _MODEL_CACHE[0]
+    r = requests.get(
+        "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+        headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},
+        timeout=30,
+    )
+    if not r.ok:
+        raise RuntimeError(f"Could not list Gemini models ({r.status_code}): {r.text[:200]}")
+    bad = ("image", "tts", "live", "audio", "embedding", "robotics", "computer", "learnlm")
+    cands = []
+    for m in r.json().get("models", []):
+        name = m["name"].removeprefix("models/")
+        if "generateContent" not in m.get("supportedGenerationMethods", []):
+            continue
+        if "flash" not in name or any(b in name for b in bad):
+            continue
+        ver = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+        stable = not any(t in name for t in ("preview", "exp"))
+        cands.append(((stable, float(ver.group(1)) if ver else 0.0, "lite" not in name), name))
+    if not cands:
+        raise RuntimeError("No Gemini Flash model is available to this API key.")
+    best = max(cands)[1]
+    _MODEL_CACHE.append(best)
+    print(f"Using Gemini model: {best}")
+    return best
+
+
 def gemini_extract(prompt: str) -> dict:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    model = pick_model()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
@@ -122,7 +181,8 @@ def gemini_extract(prompt: str) -> dict:
         if r.status_code in (429, 500, 503):
             time.sleep(15 * (attempt + 1))
             continue
-        r.raise_for_status()
+        if not r.ok:
+            raise RuntimeError(f"Gemini {r.status_code} using model {model}: {r.text[:200]}")
         data = r.json()
         return parse_model_json(data["candidates"][0]["content"]["parts"][0]["text"])
     raise RuntimeError(
