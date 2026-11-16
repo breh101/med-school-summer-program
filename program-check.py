@@ -60,7 +60,7 @@ def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip().lower()
 
 
-def application_date_is_today(value: str, today: datetime.date) -> bool:
+def application_date_has_arrived(value: str, today: datetime.date) -> bool:
     text = re.sub(r"(?<=\d)(?:st|nd|rd|th)\b", "", (value or "").strip(), flags=re.I)
     text = text.replace(".", "")
     year_match = re.search(r"\b(19|20)\d{2}\b", text)
@@ -102,7 +102,7 @@ def application_date_is_today(value: str, today: datetime.date) -> bool:
                 year = int(month_day.group(3))
 
     try:
-        return datetime.date(year, month, day) == today
+        return datetime.date(year, month, day) <= today
     except ValueError:
         return False
 
@@ -395,7 +395,7 @@ def main() -> None:
             norm(row[col["expected release"]]) == "out now" and not recheck_posted
         ):
             continue
-        opening_date_reached = application_date_is_today(
+        opening_date_reached = application_date_has_arrived(
             row[col["expected release"]], today
         )
         if opening_date_reached:
@@ -460,7 +460,7 @@ def main() -> None:
             if header in col and (val or key in REQUIRED_2027_FIELDS):
                 lines.append(f"  {header}: {val}")
         application_open_date = (result.get("application_open_date") or "").strip()
-        opening_date_reached = opening_date_reached or application_date_is_today(
+        opening_date_reached = opening_date_reached or application_date_has_arrived(
             application_open_date, today
         )
         if result.get("applications_open") or opening_date_reached:
