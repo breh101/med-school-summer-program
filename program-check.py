@@ -9,14 +9,15 @@ How it works:
 - Marks missing 2027 stipend, dates, and deadlines as "N/A" after all source pages
   are readable, then replaces those placeholders when values are announced.
 - When 2027 info is found: fills the sheet, records the application opening date
-  or marks Expected Release "Out Now" only when applications are open, stamps Last
-  Updated, and emails you right away.
+  or changes Expected Release to "Out Now" when that date arrives or the site confirms
+  applications are open; stamps Last Updated, and emails you right away.
 - Mondays (UTC): emails a status digest of programs still pending.
 - Manual workflow runs (FORCE_EMAIL=1) always send an email, as a test.
 
 Env: GEMINI_API_KEY, GOOGLE_SERVICE_ACCOUNT_JSON, SHEET_ID, GMAIL_USER,
      GMAIL_APP_PASSWORD, NOTIFY_TO, TARGET_YEAR (default 2027),
-     GEMINI_MODEL (optional; otherwise auto-picks a stable Flash Lite model)
+     GEMINI_MODEL (optional; otherwise auto-picks a stable Flash Lite model),
+     APP_TIMEZONE (default America/New_York)
 """
 import base64
 import datetime
@@ -28,12 +29,14 @@ import time
 from email.message import EmailMessage
 from html.parser import HTMLParser
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import gspread
 import requests
 from gspread.utils import rowcol_to_a1
 
 TARGET_YEAR = os.environ.get("TARGET_YEAR", "2027")
+APP_TIMEZONE = ZoneInfo(os.environ.get("APP_TIMEZONE", "America/New_York"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip()  # blank = auto-pick a free Flash model
 _MODEL_CACHE = []
 FILL_COLUMNS = {  # Gemini JSON key -> sheet header (normalized)
@@ -55,6 +58,53 @@ HEADERS = {
 # ---------- helpers ----------
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip().lower()
+
+
+def application_date_is_today(value: str, today: datetime.date) -> bool:
+    text = re.sub(r"(?<=\d)(?:st|nd|rd|th)\b", "", (value or "").strip(), flags=re.I)
+    text = text.replace(".", "")
+    year_match = re.search(r"\b(19|20)\d{2}\b", text)
+    year = int(year_match.group()) if year_match else today.year
+
+    iso = re.search(r"\b((?:19|20)\d{2})-(\d{1,2})-(\d{1,2})\b", text)
+    if iso:
+        month, day, year = int(iso.group(2)), int(iso.group(3)), int(iso.group(1))
+    else:
+        numeric = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b", text)
+        if numeric:
+            month, day = int(numeric.group(1)), int(numeric.group(2))
+            if numeric.group(3):
+                year = int(numeric.group(3))
+                if year < 100:
+                    year += 2000 if year < 70 else 1900
+        else:
+            month_names = (
+                "january|february|march|april|may|june|july|august|"
+                "september|october|november|december|jan|feb|mar|apr|"
+                "jun|jul|aug|sep|sept|oct|nov|dec"
+            )
+            month_day = re.search(
+                rf"\b({month_names})\s+(\d{{1,2}})(?:,?\s+((?:19|20)\d{{2}}))?\b",
+                text,
+                flags=re.I,
+            )
+            if not month_day:
+                return False
+            try:
+                month = datetime.datetime.strptime(month_day.group(1), "%B").month
+            except ValueError:
+                try:
+                    month = datetime.datetime.strptime(month_day.group(1)[:3], "%b").month
+                except ValueError:
+                    return False
+            day = int(month_day.group(2))
+            if month_day.group(3):
+                year = int(month_day.group(3))
+
+    try:
+        return datetime.date(year, month, day) == today
+    except ValueError:
+        return False
 
 
 class TextExtractor(HTMLParser):
@@ -332,10 +382,12 @@ def main() -> None:
         if required not in col:
             raise SystemExit(f"Missing column: {required}")
     src_col = col.get("source url")
-    today = datetime.datetime.now(datetime.timezone.utc).date()
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    utc_today = now_utc.date()
+    today = now_utc.astimezone(APP_TIMEZONE).date()
     recheck_posted = os.environ.get("RECHECK_POSTED") == "1"
 
-    found, pending, errors = [], [], []
+    found, pending, errors, opening_alerts = [], [], [], []
     for row_num, row in enumerate(data[1:], start=2):
         row = row + [""] * (len(headers) - len(row))
         name = row[col["program name"]].strip()
@@ -343,6 +395,21 @@ def main() -> None:
             norm(row[col["expected release"]]) == "out now" and not recheck_posted
         ):
             continue
+        opening_date_reached = application_date_is_today(
+            row[col["expected release"]], today
+        )
+        if opening_date_reached:
+            updates = [{
+                "range": rowcol_to_a1(row_num, col["expected release"] + 1),
+                "values": [["Out Now"]],
+            }]
+            if "last updated" in col:
+                updates.append({
+                    "range": rowcol_to_a1(row_num, col["last updated"] + 1),
+                    "values": [[today.isoformat()]],
+                })
+            ws.batch_update(updates, value_input_option="RAW")
+            row[col["expected release"]] = "Out Now"
         try:
             sources = parse_sources(row[src_col] if src_col is not None else "")
             current = {
@@ -354,6 +421,10 @@ def main() -> None:
             result = check_program(name, uni, current, sources)
         except Exception as e:  # keep going if one program fails
             errors.append(f"{name}: {e}")
+            if opening_date_reached:
+                opening_alerts.append(
+                    f"- {name}: opening date reached; Expected Release set to Out Now."
+                )
             continue
 
         if not result.get("found"):
@@ -373,6 +444,10 @@ def main() -> None:
                             "values": [[today.isoformat()]],
                         })
                     ws.batch_update(updates, value_input_option="RAW")
+            if opening_date_reached:
+                opening_alerts.append(
+                    f"- {name}: opening date reached; Expected Release set to Out Now."
+                )
             continue
 
         updates, lines = [], []
@@ -384,17 +459,27 @@ def main() -> None:
                 updates.append({"range": rowcol_to_a1(row_num, col[header] + 1), "values": [[val]]})
             if header in col and (val or key in REQUIRED_2027_FIELDS):
                 lines.append(f"  {header}: {val}")
-        if result.get("applications_open"):
+        application_open_date = (result.get("application_open_date") or "").strip()
+        opening_date_reached = opening_date_reached or application_date_is_today(
+            application_open_date, today
+        )
+        if result.get("applications_open") or opening_date_reached:
             release = "Out Now"
         else:
-            release = (result.get("application_open_date") or "").strip()
+            release = application_open_date
         if release and norm(row[col["expected release"]]) != norm(release):
             updates.append({
                 "range": rowcol_to_a1(row_num, col["expected release"] + 1),
                 "values": [[release]],
             })
             lines.append(f"  expected release: {release}")
+        elif opening_date_reached:
+            lines.append("  expected release: Out Now (opening date reached)")
         if not updates:
+            if opening_date_reached:
+                opening_alerts.append(
+                    f"- {name}: opening date reached; Expected Release set to Out Now."
+                )
             continue
         if "last updated" in col:
             updates.append({"range": rowcol_to_a1(row_num, col["last updated"] + 1), "values": [[today.isoformat()]]})
@@ -403,17 +488,24 @@ def main() -> None:
 
     force = os.environ.get("FORCE_EMAIL") == "1"  # manual test runs
     weekly_digest = (
-        today.weekday() == 0 and os.environ.get("WEEKLY_DIGEST") == "1"
+        utc_today.weekday() == 0 and os.environ.get("WEEKLY_DIGEST") == "1"
     )
     parts = []
     if found:
         parts.append(f"{TARGET_YEAR} info is now posted (sheet updated):\n\n" + "\n\n".join(found))
+    if opening_alerts:
+        parts.append("Application opening dates reached:\n" + "\n".join(opening_alerts))
     if (weekly_digest or force) and pending:
         parts.append("Still waiting on:\n" + "\n".join(pending))
-    if errors and (found or weekly_digest or force):
+    if errors and (found or opening_alerts or weekly_digest or force):
         parts.append("Errors:\n" + "\n".join(errors))
-    if found:
-        send_email(f"{len(found)} program(s) posted {TARGET_YEAR} info", "\n\n".join(parts))
+    if found or opening_alerts:
+        subject = (
+            f"{len(found)} program(s) posted {TARGET_YEAR} info"
+            if found
+            else "Application opening date reached"
+        )
+        send_email(subject, "\n\n".join(parts))
     elif force or (weekly_digest and (pending or errors)):
         subject = "Test run: email is working" if force else "Weekly update: nothing new yet"
         body = "\n\n".join(parts) or f"No program has posted {TARGET_YEAR} info yet."
