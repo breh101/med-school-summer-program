@@ -2,7 +2,7 @@ name: Program dates check
 on:
   schedule:
     - cron: "0 13 * * *"   # daily check and Monday digest, 13:00 UTC
-    - cron: "0 1,7,19 * * *"  # additional checks, about every 6 hours
+    - cron: "0 1 * * *"   # second daily check, 12 hours after the first
   workflow_dispatch:
     inputs:
       recheck_posted:

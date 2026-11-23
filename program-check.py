@@ -1,7 +1,7 @@
 """Scheduled check of every program in the Google Sheet for next-cycle dates (free version).
 
 How it works:
-- Runs four times daily, about six hours apart.
+- Runs twice daily, about 12 hours apart.
 - Skips rows whose "Expected Release" is "Out Now".
 - Fetches each program's Source URL page(s) directly (free).
 - Only if the page text mentions the target year does it ask Gemini (free tier)
@@ -138,24 +138,66 @@ def _direct_text(url: str) -> str:
     return re.sub(r"\s+", " ", " ".join(parser.parts))
 
 
+def _status(e: Exception) -> str:
+    resp = getattr(e, "response", None)
+    return str(resp.status_code) if resp is not None else type(e).__name__
+
+
+def _reader_text(url: str) -> str:
+    r = requests.get(
+        "https://r.jina.ai/" + url,
+        headers={"User-Agent": HEADERS["User-Agent"], "Accept": "text/plain"},
+        timeout=60,
+    )
+    r.raise_for_status()
+    return re.sub(r"\s+", " ", r.text)
+
+
+def _gemini_page_text(url: str) -> str:
+    """Last resort: have Gemini fetch the page from Google's side (free tier)."""
+    model = pick_model()
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = {
+        "contents": [{"parts": [{"text": (
+            f"Fetch {url} and return the full visible text of the page, verbatim, "
+            "with no commentary or summary."
+        )}]}],
+        "tools": [{"url_context": {}}],
+        "generationConfig": {"temperature": 0},
+    }
+    r = requests.post(
+        endpoint,
+        headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"], "Content-Type": "application/json"},
+        json=body,
+        timeout=120,
+    )
+    r.raise_for_status()
+    parts = r.json()["candidates"][0]["content"]["parts"]
+    return re.sub(r"\s+", " ", " ".join(p.get("text", "") for p in parts))
+
+
 def fetch_text(url: str) -> str:
-    """Fetch page text. Many university sites block GitHub's servers (403/404),
-    so fall back to the free r.jina.ai reader, which fetches the public page for us."""
-    try:
-        return _direct_text(url)
-    except Exception as first:
-        if os.environ.get("USE_READER_FALLBACK", "1") != "1":
-            raise
+    """Fetch page text. Many sites block GitHub's servers (403) at random, so:
+    retry the direct fetch, then try the r.jina.ai reader, then Gemini's own URL fetch."""
+    errors = []
+    for attempt in range(3):
         try:
-            r = requests.get(
-                "https://r.jina.ai/" + url,
-                headers={"User-Agent": HEADERS["User-Agent"], "Accept": "text/plain"},
-                timeout=60,
-            )
-            r.raise_for_status()
-            return re.sub(r"\s+", " ", r.text)
-        except Exception:
-            raise first
+            return _direct_text(url)
+        except Exception as e:
+            errors.append(f"direct {_status(e)}")
+            if _status(e) not in ("403", "429", "500", "502", "503", "504", "Timeout", "ConnectionError"):
+                break
+            time.sleep(5 * (attempt + 1))
+    if os.environ.get("USE_READER_FALLBACK", "1") == "1":
+        for label, fn in (("reader", _reader_text), ("gemini", _gemini_page_text)):
+            try:
+                text = fn(url)
+                if len(text) > 300:
+                    return text
+                errors.append(f"{label} returned too little text")
+            except Exception as e:
+                errors.append(f"{label} {_status(e)}")
+    raise RuntimeError(", ".join(dict.fromkeys(errors)))
 
 
 def focus(text: str, limit: int = 30000) -> str:
