@@ -428,7 +428,10 @@ def main() -> None:
             continue
 
         if not result.get("found"):
-            pending.append(f"- {name}: {result.get('notes', 'nothing new')}")
+            release_now = row[col["expected release"]].strip() or "not listed"
+            pending.append(
+                f"- {name} (expected release: {release_now}): {result.get('notes', 'nothing new')}"
+            )
             if result.get("checked"):
                 updates = []
                 for header in REQUIRED_2027_FIELDS:
@@ -475,6 +478,8 @@ def main() -> None:
             lines.append(f"  expected release: {release}")
         elif opening_date_reached:
             lines.append("  expected release: Out Now (opening date reached)")
+        if not any(l.startswith("  expected release") for l in lines):
+            lines.append(f"  expected release: {row[col['expected release']].strip() or 'not listed'}")
         if not updates:
             if opening_date_reached:
                 opening_alerts.append(
