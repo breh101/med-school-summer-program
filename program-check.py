@@ -459,7 +459,8 @@ def main() -> None:
                 for h in ("dates", "deadline", "stipend", "decision date", "expected release")
                 if h in col
             }
-            uni = row[col["university"]] if "university" in col else ""
+            uni_idx = next((i for h, i in col.items() if h.startswith("university")), None)
+            uni = row[uni_idx] if uni_idx is not None else ""
             result = check_program(name, uni, current, sources)
         except Exception as e:  # keep going if one program fails
             errors.append(f"{name}: {e}")
